@@ -13,6 +13,10 @@ property evaluations go through a PropertyCache.
 
 import numpy as np
 from hydrogen_pfhx import ortho_para_dynamics, starting_guess
+from hydrogen_pfhx.property_cache import PropertyCache
+
+# property cache shared by all streams; model.model clears it at the start of each run
+_property_cache = PropertyCache()
 
 
 def build_boundary_properties(topology, streams_config):
@@ -86,8 +90,8 @@ def update_parameters(process_properties, streams, topology, boundary_properties
             xp = np.max((0.0, np.min((xp_raw, 1.0))))
             stream.update_composition(xp)
 
-        # evaluate the stream's properties at its new state
-        stream.set_properties()
+        # evaluate the stream's properties at its new state (cached if seen before)
+        _property_cache.set_properties(stream)
 
     return streams
 

@@ -98,9 +98,6 @@ def model(configuration):
     # constant boundary-condition Jacobians
     dbc_dya, dbc_dyb = bvp_model.build_bc_jacobians(topology)
 
-    # analytic Jacobian in the solver's dimensionless units (analytic_jacobian.py)
-    from hydrogen_pfhx.analytic_jacobian import normalized_fun_jac as _normalized_fun_jac
-
     # one BVP solve from a given mesh and guess; reused by the continuation fallback
     def _solve(x_start, y_start):
         return diagnostics.solve_with_diagnostics(
@@ -109,8 +106,6 @@ def model(configuration):
             lambda ya, yb: bvp_model.boundary_condition(
                 ya, yb, topology, boundary_properties),
             x_start, y_start,
-            fun_jac=lambda x, y: _normalized_fun_jac(
-                x, y, additional_parameters, bvp_model.get_state_scales),
             bc_jac=lambda ya, yb: (dbc_dya, dbc_dyb),
             tol=configuration['simulation']['tolerance'], max_nodes=configuration['simulation'].get('max_nodes', 1000))
     # direct solve; if it fails for a case with catalysed streams, retry by stepping
