@@ -1,39 +1,36 @@
+"""Plate-fin heat exchanger: geometry, heat transfer and pressure drop.
+
+PlateFinHex turns the configuration's 'reactor' block and the Topology into
+channel counts, flow areas and heated areas, evaluates each stream's film
+coefficient and pressure gradient (offset-strip fins: Manglik-Bergles;
+catalyst-filled channels: Martin's wall coefficient with a Zehner-Bauer-
+Schluender bed conductivity, and Ergun's pressure drop), and the heat
+duty across every interface. bvp_model.bvp_function calls it at every node.
+"""
+
 import numpy as np
 from functools import cached_property
-from hydrogen_pfhx import heat_transfer_models, pressure_models
+from hydrogen_pfhx import heat_transfer_models
 from hydrogen_pfhx.topology import PACKED_BED
 
 
 class PlateFinHex(object):
-    """Generic multi-stream plate-fin heat exchanger.
 
-    All structure comes from the `Topology` object (see topology.py):
-    channel fractions, which streams exchange heat, how each channel's
-    wetted perimeter is split between its neighbours, and the state
-    layout. Nothing about stream count or stacking order is hard-coded
-    here.
-
-    Two stream types are dispatched on:
-      PACKED_BED - catalyst-filled: Ergun friction factor, effective
-        radial (bed) conductivity, wall-temperature-corrected Nusselt
-        via Gnielinski with a laminar/transition/turbulent branch.
-      PLAIN_FIN  - unpacked: Manglik-Bergles f and j, no wall-temperature
-        dependence.
-
-    Per-stream transport state is stored in dicts keyed by stream label
-    (self.h[label], self.f[label], self.k_bed[label]) rather than the
-    h_hot/h_cold_1/... attributes the hand-written topologies used.
+    """Exchanger geometry and the per-stream transport results (h, f, k_bed,
+    surface efficiencies) of the most recent evaluation.
     """
-
     def __init__(self, reactor_configuration, topology):
         self.topology = topology
 
-        # per-stream transport state, filled by *_transport_behaviour
-        self.h = {}          # effective (fin-corrected) film coefficient
-        self.f = {}          # friction factor
-        self.k_bed = {}      # effective radial bed conductivity (packed only)
+        # per-stream results of the latest transport evaluation (filled at every node)
+        self.h = {}
+        self.f = {}
+        self.k_bed = {}
+        self.h_bare = {}
+        self.eta_two = {}
+        self.eta_one = {}
 
-        # input
+        # core geometry from the configuration (m)
         self.length = reactor_configuration['length']
         self.width = reactor_configuration['width']
         self.height = reactor_configuration['height']
@@ -43,80 +40,101 @@ class PlateFinHex(object):
         self.seration_length = reactor_configuration['seration_length']
         self.parting_sheet_thickness = reactor_configuration['parting_sheet_thickness']
 
-    # ------------------------------------------------------------------
-    # geometry (unchanged from the hand-written versions)
-    # ------------------------------------------------------------------
     @cached_property
     def fin_spacing(self):
+        """Free gap between neighbouring fins, s = pitch - thickness (m)."""
         return self.fin_pitch - self.fin_thickness
 
     @cached_property
     def hydraulic_perimeter(self):
+        """Wetted perimeter of one channel: two fin flanks plus two plate faces (m)."""
         return 2 * (self.fin_height + self.fin_spacing)
 
     @cached_property
     def single_channel_area(self):
+        """Free-flow cross-section of one channel (m2)."""
         return self.fin_spacing * self.fin_height
 
     @cached_property
     def hydraulic_diameter(self):
+        """Plain-channel hydraulic diameter 4A/P (m): used for the catalyst-filled
+        channels (Martin's D_t and the bed conduction term).
+        """
         return 4 * self.single_channel_area / self.hydraulic_perimeter
 
     @cached_property
-    def characteristic_length(self):
-        return self.hydraulic_diameter
+    def offset_strip_hydraulic_diameter(self):
+        """Hydraulic diameter of Manglik & Bergles (1995), including the fin edges
+        exposed at every serration: 4 s h l / (2 (s l + h l + t h) + t s). Their
+        f and j were fitted with it, so it is used for Re, h and dP of fin streams.
+        """
+        s, h = self.fin_spacing, self.fin_height
+        l, t = self.seration_length, self.fin_thickness
+        return 4 * s * h * l / (2 * (s * l + h * l + t * h) + t * s)
+
+    def _wall_temperature(self, label, stream, temperatures):
+        """Estimated wall temperature of a stream: the mean of its own temperature
+        and the contact-area-weighted mean of its neighbours. Only used to
+        evaluate the fin metal's conductivity.
+        """
+        shares = self.topology.area_share[label]
+        neighbours = self.topology.neighbours[label]
+        # contact-area-weighted mean neighbour temperature
+        weight = sum(shares[n] for n in neighbours)
+        neighbour_mean = sum(shares[n] * temperatures[n] for n in neighbours) / weight
+        return (stream.temperature + neighbour_mean) / 2
 
     @cached_property
     def layer_height(self):
+        """Height of one layer: fin height + fin thickness + parting sheet (m)."""
         return self.fin_height + self.fin_thickness + self.parting_sheet_thickness
 
     @cached_property
     def number_layers(self):
-        """Rounded DOWN to a whole number of periods, so the stack always
-        terminates on a complete repeating unit - the period length now
-        comes from the topology rather than being hard-coded to 4."""
+        """Whole repeats of layer_order that fit in the stack height."""
+        # round down to whole repeats so every stream keeps its share of layers
         layers_per_period = self.topology.n_positions
         return np.floor(self.height / self.layer_height / layers_per_period) * layers_per_period
 
     @cached_property
     def total_channels(self):
+        """Channels over all layers: (width / pitch) per layer."""
         channels_per_layer = np.floor(self.width / self.fin_pitch)
         return channels_per_layer * self.number_layers
 
     def channels(self, label):
-        """Number of channels belonging to `label`."""
+        """Channels belonging to one stream."""
         return self.topology.channel_fraction[label] * self.total_channels
 
     def total_side_area(self, label):
-        """Total flow cross-sectional area for `label`."""
+        """Total free-flow cross-section of one stream (m2)."""
         return self.single_channel_area * self.channels(label)
 
     @cached_property
-    def total_channel_area(self):
-        return self.single_channel_area * self.total_channels
-
-    @cached_property
     def fin_area_fraction(self):
+        """Share of the channel perimeter formed by fins (the rest is plate)."""
         return 2 * self.fin_height / self.hydraulic_perimeter
 
     def interface_area_per_length(self, label_a, label_b):
-        """Heat transfer area per unit reactor length (m2/m) for the
-        interface between two streams.
-
-        Computed from side `label_a`: (that stream's share of its own
-        perimeter facing label_b) x perimeter x (its channel count).
-
-        This is symmetric - computing from either side gives the same
-        area - which is a genuine invariant of the topology derivation,
-        not an assumption: see `check_area_consistency`.
+        """CONTACT area per unit length between two streams (m2/m), from the
+        topology's area_share; equal from both sides (check_area_consistency).
         """
         share = self.topology.area_share[label_a].get(label_b, 0.0)
         return share * self.hydraulic_perimeter * self.channels(label_a)
 
+    def heated_area_per_length(self, label, neighbour):
+        """(two-sided, one-sided) HEATED perimeter area per unit length (m2/m) of
+        `label` facing `neighbour`; differs from the contact area for one-sided
+        layers (see topology.Topology._build_geometry).
+        """
+        scale = self.hydraulic_perimeter * self.channels(label)
+        return (self.topology.heated_share_two.get(label, {}).get(neighbour, 0.0) * scale,
+                self.topology.heated_share_one.get(label, {}).get(neighbour, 0.0) * scale)
+
     def check_area_consistency(self, rtol=1e-9):
-        """Verifies each interface's area is the same computed from
-        either side. Cheap, and catches any future topology-derivation
-        mistake immediately rather than as a silent energy imbalance."""
+        """Raise if an interface's contact area differs depending on the side it
+        is computed from (a topology inconsistency). Called once by model.model.
+        """
         for a, b in self.topology.interfaces:
             area_ab = self.interface_area_per_length(a, b)
             area_ba = self.interface_area_per_length(b, a)
@@ -125,185 +143,204 @@ class PlateFinHex(object):
                     "interface %s<->%s area mismatch: %.6e from %s vs %.6e "
                     "from %s" % (a, b, area_ab, a, area_ba, b))
 
-    # ------------------------------------------------------------------
-    # heat transfer
-    # ------------------------------------------------------------------
     def calculate_heat_transfer_duty(self, temperatures):
-        """`temperatures`: {label: T}. Returns (duties, terms) where
-        duties[(a, b)] is the linear heat duty (W/m) flowing from a to b
-        for each interface in topology.interfaces, and terms[(a, b)] is
-        that interface's list of resistance terms (for diagnostics).
-
-        Sign convention: duties[(a, b)] > 0 means heat flows a -> b, so
-        it is a LOSS for a and a GAIN for b. The caller applies each
-        stream's own flow-direction sign.
+        """Heat flow per unit length (W/m) across every interface at one node,
+        positive from the first to the second stream of the pair. Requires
+        transport_behaviour to have been evaluated for all streams at this node.
         """
         duties = {}
         terms = {}
         for a, b in self.topology.interfaces:
+            # wall between the two streams taken at their mean temperature
             wall_temperature = (temperatures[a] + temperatures[b]) / 2
-            u, resistance_terms = self.overall_heat_transfer_coefficient(
-                a, b, wall_temperature)
-            area = self.interface_area_per_length(a, b)
-            duties[(a, b)] = u * area * (temperatures[a] - temperatures[b])
+            ua, resistance_terms = self.interface_conductance(a, b, wall_temperature)
+            duties[(a, b)] = ua * (temperatures[a] - temperatures[b])
             terms[(a, b)] = resistance_terms
         return duties, terms
 
-    def overall_heat_transfer_coefficient(self, label_a, label_b, wall_temperature):
-        """Series resistance network for one interface, built ADDITIVELY:
-          - one film-coefficient term per side
-          - one parting-sheet conduction term
-          - one packed-bed radial conduction term PER PACKED SIDE
+    def interface_conductance(self, label_a, label_b, wall_temperature):
+        """UA per unit length (W/(m K)) of one interface:
 
-        The last point is the generalisation: the hand-written versions
-        had a fixed 4-term (packed-vs-plain) or 3-term (plain-vs-plain)
-        form. Building it additively also covers a packed<->packed
-        interface (two bed terms), which is reachable in a topology like
-        [h1, c1, c2, h2] where two packed layers end up adjacent.
+            1/UA = 1/G_a + 1/G_b + (R_bed,a + R_bed,b + R_wall) / A_contact
+
+        G = h_bare (eta_two A_two + eta_one A_one) is each side's film conductance
+        over its own heated area; the parting sheet and the radial conduction
+        through a catalyst bed are per contact area. Returns (UA, resistances).
         """
         solid_thermal_conductivity = np.mean(
             heat_transfer_models.aluminium_thermal_conductivity(wall_temperature))
-
-        terms = []
-        for label in (label_a, label_b):
+        # series resistances per unit length: each side's film (own heated area) ...
+        contact_area = self.interface_area_per_length(label_a, label_b)
+        resistances = []
+        per_contact = 0.0
+        for label, other in ((label_a, label_b), (label_b, label_a)):
+            area_two, area_one = self.heated_area_per_length(label, other)
+            conductance = self.h_bare[label] * (
+                self.eta_two[label] * area_two + self.eta_one[label] * area_one)
+            resistances.append(1 / conductance)
             if self.topology.is_packed(label):
-                terms.append(self.hydraulic_diameter / (8 * self.k_bed[label]))
-            terms.append(1 / self.h[label])
-        terms.append(self.parting_sheet_thickness / solid_thermal_conductivity)
+                # ... radial conduction through a catalyst bed, per contact area ...
+                per_contact = per_contact + self.hydraulic_diameter / (8 * self.k_bed[label])
+        # ... and conduction through the parting sheet
+        per_contact = per_contact + self.parting_sheet_thickness / solid_thermal_conductivity
+        resistances.append(per_contact / contact_area)
+        return 1 / sum(resistances), resistances
 
-        u = 1 / np.sum(terms)
-        return u, terms
+    def overall_heat_transfer_coefficient(self, label_a, label_b, wall_temperature):
+        """Overall U per unit CONTACT area (W/(m2 K)); reported in the results."""
+        ua, terms = self.interface_conductance(label_a, label_b, wall_temperature)
+        return ua / self.interface_area_per_length(label_a, label_b), terms
 
-    def calculate_fin_efficiency(self, h, k_fin):
-        """Efficiency of a straight fin."""
+    def overall_surface_efficiency(self, h, k_fin):
+        """Overall surface efficiency of a two-sided layer:
+        eta_o = 1 - (A_fin/A) (1 - eta_fin), fins as two half-height fins.
+        """
+        eta_fin = self.calculate_fin_efficiency(h, k_fin)
+        return 1 - self.fin_area_fraction * (1 - eta_fin)
+
+    def overall_surface_efficiency_one_sided(self, h, k_fin):
+        """Overall surface efficiency of a one-sided layer: fins heated from one
+        wall only, conducting over their full height to an insulated far wall,
+        which is counted as finned surface (it sits at fin-tip temperature).
+        """
+        eta_fin = self.calculate_fin_efficiency(h, k_fin, fin_length=self.fin_height)
+        finned_fraction = (2 * self.fin_height + self.fin_spacing) / self.hydraulic_perimeter
+        return 1 - finned_fraction * (1 - eta_fin)
+
+    def calculate_fin_efficiency(self, h, k_fin, fin_length=None):
+        """Straight-fin efficiency tanh(mL)/(mL), m = sqrt(2h / (k_fin t));
+        L = half the fin height by default, the full height for one-sided layers.
+        """
+        # no fin correction for a vanishing film coefficient
         if h <= 0 or k_fin <= 0:
             return 1.0
         m = np.sqrt((2.0 * h) / (k_fin * self.fin_thickness))
-        # b = HALF the fin height, per Shah & Sekulic's standard plate-fin
-        # treatment: the two parting sheets bounding a fin channel sit at
-        # nearly the same temperature, so the fin's midplane carries zero
-        # heat flux by symmetry - exactly like a true adiabatic tip - and
-        # each fin is modelled as two half-height fins back-to-back.
-        # Using the full height systematically UNDERESTIMATES fin
-        # efficiency and therefore every effective film coefficient and
-        # overall U.
-        mb = m * (self.fin_height / 2.0)
+        mb = m * (self.fin_height / 2.0 if fin_length is None else fin_length)
         return np.tanh(mb) / mb
 
-    # ------------------------------------------------------------------
-    # transport behaviour - dispatched on stream type
-    # ------------------------------------------------------------------
     def transport_behaviour(self, label, stream, catalyst, temperatures):
-        """Computes and stores f, h (and k_bed for packed streams) for
-        one stream, dispatching on its type."""
+        """Evaluate the film coefficient (and friction or bed conductivity) of one
+        stream at the current node, by stream type.
+        """
         if self.topology.is_packed(label):
             self._packed_bed_transport_behaviour(
                 label, stream, catalyst, temperatures)
         else:
-            self._plain_fin_transport_behaviour(label, stream)
+            self._offset_strip_transport_behaviour(
+                label, stream, self._wall_temperature(label, stream, temperatures))
 
     def _packed_bed_transport_behaviour(self, label, stream, catalyst, temperatures):
-        """Martin et al.'s packed-bed correlation (constant-q_w variant),
-        replacing the generic duct-flow (Shah & Sekulic / Gnielinski)
-        blend previously used here.
-
-            Nu_w  = Nu_wo + 0.19 * Re_p^0.75 * Pr^0.33
-            Nu_wo = (1.3 + 5*Dp/Dt) * (k_bed/k_f)
-            h_w   = Nu_w * k_f / Dt
-
-        Dt is taken as the channel hydraulic diameter (the same
-        tube-diameter-to-hydraulic-diameter adaptation used throughout
-        this model for non-circular ducts). k_bed is effective_radial_
-        conductivity - the SAME ZBS effective conductivity already used
-        for the bed's own conduction resistance (see
-        overall_heat_transfer_coefficient's packed-bed term, which is
-        already Martin's h_bed formula for constant heat flux,
-        h_bed = 8*k_bed/Dt, in resistance form). h_w's own reference
-        conductivity is k_f (the fluid's own conductivity), NOT k_bed -
-        this is a genuine difference from the previous h_hot
-        (Nu*k_bed/D_h) and easy to get backwards.
-
-        No wall-temperature-corrected Prandtl number is needed here
-        (Martin's correlation doesn't use one), so wall_temperature is
-        not computed in this function at all - it is still needed
-        elsewhere (the parting-sheet conduction term), just not here.
+        """Catalyst-filled channel: Martin's wall coefficient
+            Nu_w = (1.3 + 5 Dp/Dt) k_bed/k_f + 0.19 Re_p^0.75 Pr^0.33,  Nu_w = h_w Dp / k_f
+        with Re_p on the superficial velocity and particle diameter, and k_bed
+        from effective_radial_conductivity. Stores h_bare, both surface
+        efficiencies and the effective h.
         """
+        # fin conductivity at the wall temperature, bed conductivity at the stream state
+        wall_temperature = self._wall_temperature(label, stream, temperatures)
+        k_fin = heat_transfer_models.aluminium_thermal_conductivity(wall_temperature)
+
         self.k_bed[label] = self.effective_radial_conductivity(
             stream, catalyst, self.hydraulic_diameter)
         Pr = stream.viscosity * stream.specific_heat_capacity / \
             stream.thermal_conductivity
 
-        stream.calculate_reynolds_number(catalyst.particle_diameter)
-        Re = stream.reynolds_number
-
-        self.f[label] = pressure_models.ergun_equation(catalyst.void_fraction, Re)
-
-        if Re < 0:
-            print('Cannot have negative Reynolds')
+        # particle Reynolds number on the superficial (empty-channel) velocity
+        u_superficial = catalyst.void_fraction * stream.velocity
+        Re = (stream.mass_density * u_superficial * catalyst.particle_diameter
+              / stream.viscosity)
+        stream.reynolds_number = Re
 
         Dp = catalyst.particle_diameter
         Dt = self.hydraulic_diameter
+        # Martin's wall Nusselt number, defined with the particle diameter
         Nu_wo = (1.3 + 5 * Dp / Dt) * (self.k_bed[label] / stream.thermal_conductivity)
         Nu = Nu_wo + 0.19 * Re**0.75 * Pr**0.33
 
-        h_w = Nu * stream.thermal_conductivity / Dt
-        self.h[label] = self.calculate_fin_efficiency(
-            h_w, stream.thermal_conductivity) * h_w
+        h_w = Nu * stream.thermal_conductivity / Dp
+        # store the bare h, both surface efficiencies and the effective (two-sided) h
+        self.h_bare[label] = h_w
+        self.eta_two[label] = self.overall_surface_efficiency(h_w, k_fin)
+        self.eta_one[label] = self.overall_surface_efficiency_one_sided(h_w, k_fin)
+        self.h[label] = self.eta_two[label] * h_w
 
-    def _plain_fin_transport_behaviour(self, label, stream):
+    def _offset_strip_transport_behaviour(self, label, stream, wall_temperature):
+        """Offset-strip fin channel: Manglik-Bergles j and f, Nu = j Re Pr^(1/3).
+        Stores h_bare, both surface efficiencies, the effective h and f.
+        """
+        # Manglik-Bergles geometry ratios s/h, t/l, t/s
         alpha = self.fin_spacing / self.fin_height
         delta = self.fin_thickness / self.seration_length
         gamma = self.fin_thickness / self.fin_spacing
         (f, j) = heat_transfer_models.manglik_bergles_heat_transfer_model(
             stream.reynolds_number, alpha, delta, gamma)
+        # film coefficient from j; fin efficiency at the wall temperature
         Nu = j * stream.reynolds_number * stream.prandtl_number**(1/3)
-        h = Nu * stream.thermal_conductivity / self.hydraulic_diameter
-        h = h * self.calculate_fin_efficiency(h, stream.thermal_conductivity)
+        h = Nu * stream.thermal_conductivity / self.offset_strip_hydraulic_diameter
+        k_fin = heat_transfer_models.aluminium_thermal_conductivity(wall_temperature)
+        self.h_bare[label] = h
+        self.eta_two[label] = self.overall_surface_efficiency(h, k_fin)
+        self.eta_one[label] = self.overall_surface_efficiency_one_sided(h, k_fin)
+        h = h * self.eta_two[label]
 
         self.f[label] = f
         self.h[label] = h
 
-    # ------------------------------------------------------------------
-    # pressure drop - dispatched on stream type
-    # ------------------------------------------------------------------
     def pressure_drop(self, label, stream, catalyst):
+        """Pressure gradient dP/dz (Pa/m) of one stream: the correlation gives the
+        magnitude, the flow direction the sign (pressure falls along the flow).
+        """
         if self.topology.is_packed(label):
-            return self._packed_bed_pressure_drop(stream, catalyst)
-        return self._plain_fin_pressure_drop(label, stream)
+            magnitude = -self._packed_bed_pressure_drop(stream, catalyst)
+        else:
+            magnitude = self._offset_strip_pressure_drop(label, stream)
+        return -self.topology.flow_sign(label) * magnitude
 
     def _packed_bed_pressure_drop(self, stream, catalyst):
+        """Frictional gradient (Pa/m, negative) of a catalyst bed (Ergun)."""
         voidage = catalyst.void_fraction
+        # superficial velocity from the interstitial stream velocity
         vs = voidage * stream.velocity
         Dp = catalyst.particle_diameter
         rho = stream.mass_density
+        # Ergun: viscous plus inertial term
         return -(150*stream.viscosity * (1-voidage)**2 * vs / (Dp**2 * voidage**3)
                  + 1.75 * rho * (1 - voidage) * vs**2 / (Dp * voidage**3))
 
-    def _plain_fin_pressure_drop(self, label, stream):
+    def _offset_strip_pressure_drop(self, label, stream):
+        """Frictional gradient magnitude (Pa/m) of a fin channel: 2 f rho u^2 / D_h (Fanning)."""
         return 2 * self.f[label] * stream.mass_density * \
-            stream.velocity**2 / self.hydraulic_diameter
+            stream.velocity**2 / self.offset_strip_hydraulic_diameter
 
-    # ------------------------------------------------------------------
     def effective_radial_conductivity(self, stream, catalyst, d_t):
+        """Effective conductivity of the catalyst bed (W/(m K)): stagnant part from
+        Zehner-Bauer-Schluender with radiation (VDI Heat Atlas, D6.3; continuum
+        gas, flattening coefficient for spheres), plus radial dispersion from the
+        flow. Used in Martin's wall coefficient and the bed resistance.
+        """
         k_f = stream.thermal_conductivity
         k_s = catalyst.calculate_thermal_conductivity(stream.temperature)
         epsilon = catalyst.void_fraction
         dp = catalyst.particle_diameter
 
+        # radiation: 4 sigma T^3 / (2/zeta - 1) with emissivity zeta (negligible at these temperatures)
         zeta = 0.9
-        alpha_rs = 2e-5 * (zeta/(2-zeta))*(stream.temperature/100)**3
+        alpha_rs = 0.2268 * (zeta/(2-zeta))*(stream.temperature/100)**3
+        k_rad = alpha_rs * dp / k_f
+        # ZBS: conductivity ratio, flattening coefficient phi, shape factor B, and core term k_c
+        k_p = k_s / k_f
+        phi = 0.0077
         B = 1.25 * ((1 - epsilon) / epsilon)**(10/9)
+        N = 1 + (k_rad - B) / k_p
+        k_c = 2 / N * (B * (k_p + k_rad - 1) / (N**2 * k_p) * np.log((k_p + k_rad) / B)
+                       + (B + 1) / (2 * B) * (k_rad - B) - (B - 1) / N)
+        # stagnant bed conductivity: gas-filled pores plus the particle-contact core
+        k_0 = k_f * ((1 - (1 - epsilon)**0.5) * (1 + epsilon * k_rad)
+                     + (1 - epsilon)**0.5 * (phi * k_p + (1 - phi) * k_c))
 
-        k_r = k_f/k_s
-        dim_alpha = alpha_rs * dp / k_f
-
-        omega = (1+(dim_alpha - 1)*k_r)/(1+(dim_alpha - B)*k_r) * np.log((1 + alpha_rs*dp/k_s) /
-                                                                         (B*k_r)) - (B-1) / (1 + (dim_alpha - B)*k_r) + (B+1) / (2*B) * (dim_alpha - B)
-        k_0 = k_f * ((1 - (1-epsilon))**0.5 * (1 + epsilon * dim_alpha) +
-                     2*omega * (1-epsilon)**0.5/(1+(dim_alpha - B)*k_r))
-
+        # radial dispersion by the flow, on the superficial velocity (eps * interstitial)
         Pe = (1 + 46*(dp/d_t)**2)/0.14
-        D_er = stream.velocity * dp / (epsilon * Pe)
+        D_er = epsilon * stream.velocity * dp / (epsilon * Pe)
         k_t = epsilon * stream.mass_density * stream.specific_heat_capacity * D_er
 
         return k_0 + k_t

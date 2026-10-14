@@ -1,42 +1,43 @@
+"""Fluid streams: state and thermophysical properties of every stream in the
+exchanger. FluidStream wraps a CoolProp equation of state for any pure
+fluid (helium, nitrogen, ...); Hydrogen builds its properties from separate
+ortho and para equations of state (hydrogen_thermodynamics) mixed at the
+stream's para fraction. bvp_model sets each stream's state at every node and
+reads the properties for the transport, kinetics and energy balance.
+"""
+
 import numpy as np
 import CoolProp.CoolProp as CP
 from hydrogen_pfhx import ortho_para_dynamics, hydrogen_thermodynamics
 
 
 class FluidStream(object):
-    # Defines a fluid stream which is an inlet for a conversion HEX.
 
-    # Construct fluid stream
-    #TODO - define mass flow rate elsewhere.
+    """One stream of a pure CoolProp fluid: inlet flow, current state and the
+    properties derived from it.
+    """
     def __init__(self, fluid, mass_flow_rate):
-        # define input attributes
         self.fluid = fluid
         self.mass_flow_rate = mass_flow_rate
 
-        # setup abstract state
+        # CoolProp equation of state and the fluid's lower limit (triple point)
         self.abstract_state = CP.AbstractState('HEOS', fluid)
+        self.triple_point_K = self.abstract_state.Ttriple()
 
-        # Environmental variables
+        # current state and the properties derived from it (set at every node)
         self.temperature = None
         self.pressure = None
-        self.phase_fraction = None
 
-        # Derived properties
-        self.phase_index = None             # see below
         self.molecular_mass = None
-        self.molar_density = None                 # molar density
+        self.molar_density = None
         self.mass_density = None
-        self.viscosity = None               # dynamic
-        self.specific_heat_capacity = None  # constant pressure
+        self.viscosity = None
+        self.specific_heat_capacity = None
         self.thermal_conductivity = None
         self.prandtl_number = None
         self.enthalpy = None
         self.entropy = None
-        self.saturation_pressure = None
-        self.latent_heat_vaporisation = None
         self.molar_flow_rate = None
-        self.liquid_fraction = None
-        self.vapor_fraction = None
 
         self.velocity = None
         self.reynolds_number = None
@@ -44,26 +45,22 @@ class FluidStream(object):
         self.critical_pressure = None
 
     def update_conditions(self, temperature, pressure):
+        """Set temperature (K) and pressure (Pa) of the stream's current state."""
         self.temperature = temperature
         self.pressure = pressure
         self.abstract_state.update(CP.PT_INPUTS, pressure, temperature)
-        # self.abstract_state.specify_phase(CP.iphase_supercritical_liquid)
-
-    def specify_phase(self, phase):
-        self.abstract_state.specify_phase(phase)
-
-    def set_mole_fractions(self, z):
-        self.mole_fractions = z
-        self.abstract_state.set_mole_fractions(z)
 
     def set_properties(self):
-        # Set all key properties for fluid.
+        """Evaluate all properties at the current state (called after
+        update_conditions, and update_composition for hydrogen).
+        """
         self.molecular_mass = self._calculate_molecular_mass()
         self.molar_density = self._calculate_molar_density()
         self.mass_density = self.molar_density * self.molecular_mass
         self.viscosity = self._calculate_viscosity()
         self.specific_heat_capacity = self._calculate_specific_heat_capacity()
         self.thermal_conductivity = self._calculate_thermal_conductivity()
+        # derived groups: Prandtl number and molar flow
         self.prandtl_number = self.viscosity * \
             self.specific_heat_capacity/self.thermal_conductivity
         self.enthalpy = self._calculate_enthalpy()
@@ -73,157 +70,101 @@ class FluidStream(object):
         self.critical_pressure = self._calculate_critical_pressure()
 
     def calculate_velocity(self, cross_sectional_area):
+        """Mean velocity (m/s) through the given free-flow area (m2)."""
         self.velocity = self.mass_flow_rate / \
             (self.mass_density * cross_sectional_area)
 
-    # Reynolds number
 
     def calculate_reynolds_number(self, characteristic_length):
+        """Reynolds number on the given length scale (m)."""
         self.reynolds_number = self.mass_density * \
             self.velocity * characteristic_length / self.viscosity
 
-    # base methods for evaluating derived properties (can be modified
-    # by subclasses, e.g. Hydrogen with mixed para/ortho)
+    # safety margin above the solid-phase limit (K)
+    TEMPERATURE_FLOOR_MARGIN_K = 1.0
+
+    def temperature_floor(self, pressure_pa):
+        """Lowest temperature (K) the solver may pass to this fluid at pressure P
+        (Pa): the triple point, or the melting temperature at P if higher, plus a
+        margin. Used by bvp_model.update_parameters and model._check_inlet_limits.
+        """
+        T_limit = self.triple_point_K
+        try:
+            # melting temperature at this pressure; absent below the melting line (e.g. helium < 2.5 MPa)
+            T_melt = self.abstract_state.melting_line(CP.iT, CP.iP, pressure_pa)
+            T_limit = max(T_limit, T_melt)
+        except ValueError:
+            pass
+        return T_limit + self.TEMPERATURE_FLOOR_MARGIN_K
+
 
     def _calculate_molar_density(self):
-        # if two-phase - then calculate contribution of each phase
-        if self.phase_index == 6:
-            # get liquid property
-            self.abstract_state.specify_phase(CP.iphase_liquid)
-            liquid_density = self.abstract_state.rhomolar()
+        rho = self.abstract_state.rhomolar()
 
-            # get vapor property
-            self.abstract_state.specify_phase(CP.iphase_vapour)
-            vapor_density = self.abstract_state.rhomolar()
-
-            # calculate combined property
-            rho = self.liquid_fraction * liquid_density + self.vapor_fraction * vapor_density
-
-            # return to two phase state
-            self.abstract_state.specify_phase(CP.iphase_twophase)
-        else:
-            rho = self.abstract_state.rhomolar()
-            
         return rho
 
     def _calculate_viscosity(self):
 
-        # if two-phase - then calculate contribution of each phase
-        if self.phase_index == 6:
-            # get liquid property
-            self.abstract_state.specify_phase(CP.iphase_liquid)
-            liquid_viscosity = self.abstract_state.viscosity()
+        mu = self.abstract_state.viscosity()
+        mu = self._bridge_helium_viscosity_seam(mu)
 
-            # get vapor property
-            self.abstract_state.specify_phase(CP.iphase_liquid)
-            vapor_viscosity = self.abstract_state.viscosity()
-
-            # calculate combined property
-            mu = self.liquid_fraction * liquid_viscosity + \
-                self.vapor_fraction * vapor_viscosity
-
-            # return to two phase state
-            self.abstract_state.specify_phase(CP.iphase_twophase)
-        else:
-            mu = self.abstract_state.viscosity()
-            
         return mu
 
+    # location and half width (K) of the bridged helium viscosity step
+    _HELIUM_SEAM_K = 100.0
+    _HELIUM_SEAM_HALF_WIDTH_K = 2.0
+
+    def _bridge_helium_viscosity_seam(self, mu):
+        """Helium only: CoolProp's viscosity correlation steps by ~2 % at 100 K.
+        Between 98 and 102 K it is replaced by a cubic Hermite bridge matching
+        value and slope of the correlation on both sides, so the solver sees a
+        smooth property.
+        """
+        T = self.temperature
+        dT = self._HELIUM_SEAM_HALF_WIDTH_K
+        if str(self.fluid).lower() != 'helium' or abs(T - self._HELIUM_SEAM_K) >= dT:
+            return mu
+
+        # separate CoolProp state so the stream's own state is not disturbed
+        if not hasattr(self, '_seam_state'):
+            self._seam_state = CP.AbstractState('HEOS', self.fluid)
+        state = self._seam_state
+
+        def mu_at(t):
+            state.update(CP.PT_INPUTS, self.pressure, t)
+            return state.viscosity()
+
+        eps = 1e-3
+        T0, T1 = self._HELIUM_SEAM_K - dT, self._HELIUM_SEAM_K + dT
+        m0, m1 = mu_at(T0), mu_at(T1)
+        # one-sided slopes of the correlation just outside the bridge
+        d0 = (m0 - mu_at(T0 - eps)) / eps
+        d1 = (mu_at(T1 + eps) - m1) / eps
+        h = T1 - T0
+        # cubic Hermite interpolation between (T0, m0, d0) and (T1, m1, d1)
+        s = (T - T0) / h
+        return ((2*s**3 - 3*s**2 + 1) * m0 + (s**3 - 2*s**2 + s) * h * d0
+                + (-2*s**3 + 3*s**2) * m1 + (s**3 - s**2) * h * d1)
+
     def _calculate_specific_heat_capacity(self):
-        if self.phase_index == 6:
-            # get liquid property
-            self.abstract_state.specify_phase(CP.iphase_liquid)
-            liquid_cp = self.abstract_state.cpmass()
-
-            # get vapor property
-            self.abstract_state.specify_phase(CP.iphase_liquid)
-            vapor_cp = self.abstract_state.cpmass()
-
-            # calculate combined property
-            cp = self.liquid_fraction * liquid_cp + self.vapor_fraction * vapor_cp
-
-            # return to two phase state
-            self.abstract_state.specify_phase(CP.iphase_twophase)
-        else:
-            cp = self.abstract_state.cpmass()
+        cp = self.abstract_state.cpmass()
 
         return cp
 
     def _calculate_thermal_conductivity(self):
-        if self.phase_index == 6:
-            # get liquid property
-            self.abstract_state.specify_phase(CP.iphase_liquid)
-            liquid_conductivity = self.abstract_state.conductivity()
-
-            # get vapor property
-            self.abstract_state.specify_phase(CP.iphase_liquid)
-            vapor_conductivity = self.abstract_state.conductivity()
-
-            # calculate combined property
-            k = self.liquid_fraction * liquid_conductivity + \
-                self.vapor_fraction * vapor_conductivity
-
-            # return to two phase state
-            self.abstract_state.specify_phase(CP.iphase_twophase)
-        else:
-            k = self.abstract_state.conductivity()
+        k = self.abstract_state.conductivity()
 
         return k
 
     def _calculate_enthalpy(self):
-        if self.phase_index == 6:
-            # get liquid property
-            self.abstract_state.specify_phase(CP.iphase_liquid)
-            liquid_enthalpy = self.abstract_state.enthalpy()
-
-            # get vapor property
-            self.abstract_state.specify_phase(CP.iphase_liquid)
-            vapor_enthalpy = self.abstract_state.enthalpy()
-
-            # calculate combined property
-            h = self.liquid_fraction * liquid_enthalpy + \
-                self.vapor_fraction * vapor_enthalpy
-
-            # return to two phase state
-            self.abstract_state.specify_phase(CP.iphase_twophase)
-        else:
-            h = self.abstract_state.hmass()
+        h = self.abstract_state.hmass()
 
         return h
 
     def _calculate_entropy(self):
-        s = self.abstract_state.smass
+        s = self.abstract_state.smass()
         return s
 
-    def _calculate_latent_heat_vaporisation(self):
-        # adjust to saturated liquid
-        self.abstract_state.update(CP.QT_INPUTS, 1, self.temperature)
-        h_v = self.abstract_state.hmass()
-
-        # adjust to saturated gas
-        self.abstract_state.update(CP.QT_INPUTS, 0, self.temperature)
-        h_l = self.abstract_state.hmass()
-
-        # calculate latent heat of vaporisation
-        lhv = h_v - h_l
-
-        # return to initial conditions
-        self.abstract_state.update(
-            CP.PT_INPUTS, self.pressure, self.temperature)
-        return lhv
-
-    # single parameter property
-    def _calculate_saturation_pressure(self):
-        # adjust to saturated gas
-        self.abstract_state.update(CP.QT_INPUTS, 0, self.temperature)
-        p_sat = self.abstract_state.p()
-
-        # return to initial conditions
-        self.abstract_state.update(
-            CP.PT_INPUTS, self.pressure, self.temperature)
-        return p_sat
-
-    # trivial properties
     def _calculate_molecular_mass(self):
         m = self.abstract_state.molar_mass()
         return m
@@ -238,17 +179,21 @@ class FluidStream(object):
 
 
 class Hydrogen(FluidStream):
-    # Hydrogen stream inlet into HEX
+    """Hydrogen stream with variable ortho/para composition: densities from the
+    ortho, para and normal equations of state, mixed at para fraction xp.
+    """
     def __init__(self, mass_flow_rate):
         FluidStream.__init__(self, 'Hydrogen', mass_flow_rate)
+        # separate equations of state for the two isomers, and normal hydrogen for transport properties
         self.ortho = hydrogen_thermodynamics.OrthoHydrogen()
         self.para = hydrogen_thermodynamics.ParaHydrogen()
         self.normal = hydrogen_thermodynamics.NormalHydrogen()
 
     def set_properties(self):
-        # Only set the densities once per update in conditions. Need
-        # to set before other properties so they can be used, but also
-        # need to determine rho guess first.
+        """Solve the ortho, para and normal densities at the current T and P
+        (CoolProp's normal-hydrogen density as starting guess), then evaluate the
+        mixture properties.
+        """
         rho_guess = self.abstract_state.rhomolar()
         self.ortho_density = self.ortho.calculate_density(
             self.pressure, self.temperature, rho_guess)
@@ -260,6 +205,7 @@ class Hydrogen(FluidStream):
         FluidStream.set_properties(self)
 
     def update_composition(self, xp):
+        """Set the para mole fraction (equal to the mass fraction for the isomers)."""
         self.xp = xp
 
     def get_xp(self):
@@ -271,6 +217,7 @@ class Hydrogen(FluidStream):
         return xo
 
     def get_xp_equil(self):
+        """Equilibrium para fraction at the stream temperature."""
         (xpe, _) = ortho_para_dynamics.para_ortho_equilibrium(self.temperature)
         return xpe
 
@@ -279,170 +226,89 @@ class Hydrogen(FluidStream):
         return xpo
 
     def get_heat_of_conversion(self):
+        """Ortho -> para conversion enthalpy at the current state (J/mol, negative
+        = exothermic), the heat source of the catalysed stream's energy balance.
+        """
         ortho_enthalpy = self.ortho.enthalpy(
             self.ortho_density, self.temperature)
         para_enthalpy = self.para.enthalpy(self.para_density, self.temperature)
         delta_h = para_enthalpy - ortho_enthalpy
         return delta_h
 
-    # linear mixing rule for bulk hydrogen density from ortho/para
-    # combo.
 
     def _calculate_molar_density(self):
-        rho = (1-self.xp)*self.ortho_density + self.xp * \
-            self.para_density        # molar density (mol/m3)
+        """Mixture molar density (mol/m3) by ideal mixing of the isomers' molar volumes."""
+        rho = 1.0 / ((1 - self.xp) / self.ortho_density
+                     + self.xp / self.para_density)
         return rho
 
     def _calculate_thermal_conductivity(self):
+        """Conductivity interpolated between normal (xp = 0.25) and para (xp = 1)
+        hydrogen; the critical enhancement uses CoolProp's background viscosity.
+        """
         viscosity_contributions = self.abstract_state.viscosity_contributions()
         mu_background = viscosity_contributions['residual'] - \
             viscosity_contributions['critical']
 
-        # para k
         ph_k, _ = self.para.thermal_conductivity(
             self.para_density, self.temperature, mu_background)
 
-        # Normal-hydrogen
         nh_k, _ = self.normal.thermal_conductivity(
             self.normal_density, self.temperature, mu_background)
 
-        # Linear interp/extrap of k
         k = nh_k + (ph_k - nh_k) * (0.75 - self.get_xo())/0.75
         return k
 
     def _calculate_specific_heat_capacity(self):
-        # para cp
+        """Frozen-composition cp (J/(kg K)): mole-fraction average of ortho and
+        para. The conversion heat is added separately in the energy balance.
+        """
         ph_cp = self.para.specific_heat_constant_pressure(
             self.para_density, self.temperature)
 
-        # ortho cp
         oh_cp = self.ortho.specific_heat_constant_pressure(
             self.ortho_density, self.temperature)
 
-        # Linear interp of cp
-        # molar specific heat capacity (J/mol K)
         cp_molar = (1-self.xp)*oh_cp + self.xp*ph_cp
-        cp = cp_molar / self.molecular_mass  # convert to cp mass (J/kg K)
+        cp = cp_molar / self.molecular_mass
         return cp
 
     def _calculate_viscosity(self):
+        """Viscosity of normal hydrogen (the isomers' viscosities are practically equal)."""
         v = self.normal.viscosity(
             self.normal_density, self.temperature, self.molecular_mass)
         return v
 
     def _calculate_enthalpy(self):
-        # para h
+        """Mixture enthalpy (J/kg): mole-fraction average of the ortho and para
+        enthalpies, including their conversion offset.
+        """
         ph_h = self.para.enthalpy(self.para_density, self.temperature)
 
-        # ortho h
         oh_h = self.ortho.enthalpy(self.ortho_density, self.temperature)
 
-        # Linear interp of h
-        # molar specific heat capacity (J/mol)
         h_molar = (1-self.xp)*oh_h + self.xp*ph_h
-        h = h_molar / self.molecular_mass  # convert to h mass (J/kg)
+        h = h_molar / self.molecular_mass
         return h
 
     def _calculate_entropy(self):
-        # para s
+        """Mole-fraction average of ortho and para entropy (J/(kg K)); output only
+        (no mixing term or ortho/para offset).
+        """
         ph_s = self.para.entropy(self.para_density, self.temperature)
 
-        # ortho s
         oh_s = self.ortho.entropy(self.ortho_density, self.temperature)
 
-        # Linear interp of cp
-        # molar specific heat capacity (J/mol)
         s_molar = (1-self.xp)*oh_s + self.xp*ph_s
-        s = s_molar / self.molecular_mass  # convert to s mass (J/kg)
+        s = s_molar / self.molecular_mass
         return s
 
     def _calculate_critical_temperature(self):
+        """Composition-weighted critical temperature (used by the property cache variants)."""
         Tc = self.get_xo()*self.ortho.Tc + self.get_xp()*self.para.Tc
         return Tc
 
     def _calculate_critical_pressure(self):
+        """Composition-weighted critical pressure."""
         Pc = self.get_xo()*self.ortho.Pc + self.get_xp()*self.para.Pc
-        return Pc
-
-
-class HeliumNeon(FluidStream):
-    def __init__(self, mass_flow_rate, helium_fraction):
-        FluidStream.__init__(self, 'Helium&Neon', mass_flow_rate)
-        self.specify_phase(CP.iphase_gas)
-        self.set_mole_fractions([helium_fraction, 1 - helium_fraction])
-
-        self.helium_as = CP.AbstractState('HEOS', 'Helium')
-        self.neon_as = CP.AbstractState('HEOS', 'Neon')
-
-        # ref temp
-        self.T0 = 298.15
-        self.mu_0 = np.array([19.8253, 31.7088])*1e-6
-        self.lam_0 = np.array([155.0008, 49.1732])*1e-3
-
-        # viscosity coeffs
-        self.a_coeffs = np.array([[6.8257552e-1,	6.75404e-1],
-                                  [1.4496203e-2,	-2.03522e-2],
-                                  [1.1987706e-3,	1.61102e-2],
-                                  [-6.7722412e-5,	-4.88074e-3],
-                                  [4.9875650e-5,	5.32334e-4],
-                                  [-6.1456994e-6,	2.93695e-4],
-                                  [1.3189407e-6,	-1.55155e-4],
-                                  [-3.7245774e-7,	3.10797e-5],
-                                  [1.3671981e-8,	-2.50504e-6],
-                                  [5.0354149e-8,	2.74563e-8],
-                                  [-1.5714379e-8, 0.0],
-                                  [1.4720785e-9, 0.0]])
-
-        # thermal cond coeffs
-        self.b_coeffs = np.array([[6.8192175e-1,	6.76478e-1],
-                                  [1.4441872e-2,	-2.13734e-2],
-                                  [1.2138429e-3,	1.63523e-2],
-                                  [-7.4912205e-5,	-4.79402e-3],
-                                  [5.2123986e-5,	4.23959e-4],
-                                  [-6.0795764e-6,	3.35013e-4],
-                                  [8.6135146e-7,	-1.53714e-4],
-                                  [-2.6311453e-7,	2.45053e-5],
-                                  [6.8367328e-8,	-5.03701e-7],
-                                  [1.6608814e-8,	-1.67000e-7],
-                                  [-9.0525341e-9, 0.0],
-                                  [9.9986305e-10, 0.0]])
-
-    def _calculate_viscosity(self):
-        T = self.temperature
-        inds = np.arange(start=1, stop=self.a_coeffs.shape[0]+1)
-        mu_vals = np.zeros((2,))
-        for f_idx in (0, 1):
-            a_vals = self.a_coeffs[:, f_idx]
-            terms = a_vals * np.log(T / self.T0) ** inds
-            r_mu_gas = np.exp(np.sum(terms))
-            mu_vals[f_idx] = r_mu_gas * self.mu_0[f_idx]
-
-        mu = np.matmul(self.mole_fractions, mu_vals)
-        return mu
-
-    def _calculate_thermal_conductivity(self):
-        T = self.temperature
-        inds = np.arange(start=1, stop=self.b_coeffs.shape[0]+1)
-        lam_vals = np.zeros((2,))
-        for f_idx in (0, 1):
-            b_vals = self.b_coeffs[:, f_idx]
-            terms = b_vals * np.log(T / self.T0) ** inds
-            r_lam_gas = np.exp(np.sum(terms))
-            lam_vals[f_idx] = r_lam_gas * self.lam_0[f_idx]
-
-        lam = np.matmul(self.mole_fractions, lam_vals)
-        return lam
-
-    def _calculate_critical_temperature(self):
-        z = self.mole_fractions
-        he_tcrit = self.helium_as.T_critical()
-        ne_tcrit = self.neon_as.T_critical()
-        Tc = z[0]*he_tcrit + z[1]*ne_tcrit
-        return Tc
-
-    def _calculate_critical_pressure(self):
-        z = self.mole_fractions
-        he_pcrit = self.helium_as.p_critical()
-        ne_pcrit = self.neon_as.p_critical()
-        Pc = z[0]*he_pcrit + z[1]*ne_pcrit
         return Pc
